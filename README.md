@@ -1,18 +1,28 @@
-# SMA 500 — 10,000-run Monte Carlo
+# SMA 500 chronological backtest + Monte Carlo
 
-## Required data
-Place `data/daily_equity.csv` from your **actual SMA 500 chronological portfolio backtest** in this repository. It must have columns `date,equity` (alternatively `datetime`/`timestamp` and `portfolio_equity`/`account_equity`/`balance`). Exactly one end-of-day portfolio equity observation per trading day, sorted automatically. At least 60 observations; 2–5 years preferred. Include no deposits, withdrawals, or equity resets. The historical portfolio backtest MUST already have been run at **2% risk per trade**, including cash, position overlap, simultaneous signals, sizing limits, costs, and correlated stock moves. A signal-scanner export or isolated per-stock trades CSV is NOT sufficient. The script deliberately fails if data is absent or mismatched.
+## Required original files
+Copy **your exact original** `backtest.py` (the code you pasted into ChatGPT) and `stocks.csv` (the same original stock universe) into this folder at repository root. They are **not included**, because the exact 500-symbol universe was not supplied and should not be invented.
 
-## GitHub steps
-1. Create a new private GitHub repository named `sma500-monte-carlo`.
-2. Upload all files and folders from this ZIP, preserving `.github/workflows/monte-carlo.yml`.
-3. Upload your historical backtest equity file to `data/daily_equity.csv`. If your columns differ, rename to `date,equity`.
-4. Verify your SMA 500 backtest was run at **2% risk per trade**, with a single combined chronological portfolio and realistic trading fees/slippage. If not, rerun the historical backtest first.
-5. Open **Actions → SMA 500 Monte Carlo (research only) → Run workflow**.
-6. After the green tick, open the run, scroll to **Artifacts**, and download `sma500-monte-carlo-results`.
-7. Inspect `summary.csv`, `simulations.csv`, and `equity_paths.png`.
+## GitHub setup
+1. Create a **private** GitHub repository, e.g. `sma500-monte-carlo`.
+2. Upload **the contents** of this ZIP (not its enclosing directory), preserving `.github/workflows/monte-carlo.yml`.
+3. Upload your original `backtest.py` and `stocks.csv` at repository root.
+4. Select **Actions** → **SMA 500 Backtest and Monte Carlo** → **Run workflow**.
+5. Set `usd_per_aud` to a rate you choose (USD per AUD). Default `0.65` is an **illustration**, not a verified market rate.
+6. Download `sma500-backtest-and-monte-carlo` from the completed workflow's **Artifacts**.
 
-## Interpretation
-This runs a 10-day circular moving-block bootstrap of historical *portfolio* daily returns, over the same number of trading days as the historical sample, with 10,000 resampled paths and a fixed random seed. Consecutive historical portfolio days remain intact inside blocks. This partially preserves observed clustering, cross-stock correlation and overlapping positions that were already embedded in the backtest. It does NOT rerun the strategy, reproduce all constraints at block boundaries, model new order fills, or guarantee future outcomes. The 10% loss threshold is a STATIC threshold against the initial A$50,000, NOT a funded-account trailing drawdown or daily loss rule. No deposits/withdrawals, taxes or FX conversion are modeled. If backtest equity is denominated in USD, convert the underlying account properly to AUD before interpreting AUD results; do not just relabel the currency. Avoid using optimized/in-sample-only data; test out-of-sample periods and stress costs separately.
+## Outputs
+- `results/portfolio/trades.csv`: actual chronological trades with 2% risk and 10 position cap
+- `results/portfolio/equity_curve_usd.csv`: chronological portfolio equity in USD
+- `results/portfolio/summary.csv`: portfolio performance and missing symbol count
+- `results/portfolio/missing_symbols.csv`: symbols without usable data
+- `results/monte_carlo/summary.csv`: Monte Carlo statistics
+- `results/monte_carlo/simulations.csv`: 10,000 simulated outcomes
+- `results/monte_carlo/equity_paths.png`: sampled simulated paths
 
-To run locally: `pip install -r requirements.txt && python monte_carlo.py`.
+## Method and caveats
+The original backtest handles signal timing, simultaneous holdings, cash allocation, stop-first OHLC execution, fees, and a 10-position cap. The Monte Carlo step **resamples blocks of the resulting combined daily portfolio returns**, preserving within-block correlation and portfolio constraints already embedded in historical equity. It does **not** rerun the stock-by-stock portfolio engine in each simulation, preserve original calendar chronology across blocks, model changing market regimes, or reproduce funded-account daily/trailing drawdown rules. The simulated 10% loss threshold is relative to initial capital. FX is assumed constant; AUD/USD volatility and conversion costs are excluded. Yahoo Finance data availability and survivorship bias in the supplied 500-stock list can materially affect results. This is research, not a prediction or trading guarantee.
+
+
+## Reconstructed stock list limitation
+`stocks.csv` contains only the **100 distinct tickers recoverable from the uploaded historical trades**, NOT the original 500-stock universe. The other 400 cannot be recovered from executed trades alone. Replace `stocks.csv` with the original full 500-symbol list before interpreting results as a replication of the original SMA 500 backtest. The 100-ticker run is only a partial-universe test.
