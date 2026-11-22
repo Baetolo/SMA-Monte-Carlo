@@ -1,0 +1,42 @@
+name: Gold Download + Backtest (Dukascopy)
+on:
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: 'UTC start date (inclusive)'
+        required: true
+        default: '2026-01-01'
+      to_date:
+        description: 'UTC end date (exclusive, max 370 days per run)'
+        required: true
+        default: '2026-02-01'
+permissions:
+  contents: read
+jobs:
+  gold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+      - name: Download XAUUSD 1-minute BID bars
+        run: python download_gold.py --from-date '${{ inputs.from_date }}' --to-date '${{ inputs.to_date }}'
+      - name: Backtest (no live orders)
+        run: python backtest.py --csv data/xauusd_1m.csv
+      - name: Exploratory Monte Carlo (not FTMO-certified)
+        run: python monte_carlo.py --simulations 10000
+      - name: Upload results and data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gold-results-${{ inputs.from_date }}
+          path: |
+            outputs/*.csv
+            data/xauusd_1m.csv
+            data/download_issues.csv
+          if-no-files-found: warn
+          retention-days: 7
