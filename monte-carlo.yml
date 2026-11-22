@@ -1,0 +1,24 @@
+name: SMA 500 Monte Carlo (research only)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  monte-carlo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run Monte Carlo
+        run: python monte_carlo.py --equity data/daily_equity.csv --capital 50000 --risk 2 --runs 10000 --block 10 --loss-limit 0.10
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sma500-monte-carlo-results
+          path: results/
+          if-no-files-found: warn
