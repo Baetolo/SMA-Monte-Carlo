@@ -1,12 +1,17 @@
-name: SMA 500 Monte Carlo (research only)
+name: SMA 500 Backtest and Monte Carlo
 on:
   workflow_dispatch:
+    inputs:
+      usd_per_aud:
+        description: 'Assumed USD per 1 AUD (example 0.65; check current rate yourself)'
+        required: true
+        default: '0.65'
 permissions:
   contents: read
 jobs:
-  monte-carlo:
+  research:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -14,11 +19,13 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Run Monte Carlo
-        run: python monte_carlo.py --equity data/daily_equity.csv --capital 50000 --risk 2 --runs 10000 --block 10 --loss-limit 0.10
+      - name: Run chronological portfolio backtest at 2% risk
+        run: python run_portfolio.py --capital-aud 50000 --usd-per-aud "${{ inputs.usd_per_aud }}" --risk 2 --max-positions 10
+      - name: Run 10000 block-bootstrap simulations
+        run: python monte_carlo.py --equity data/daily_equity.csv --capital 50000 --risk 2 --runs 10000 --block 10 --loss-limit 0.10 --out results/monte_carlo
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sma500-monte-carlo-results
+          name: sma500-backtest-and-monte-carlo
           path: results/
           if-no-files-found: warn
