@@ -1,0 +1,2 @@
+simulations,historical_days,phase1_pass_pct,overall_two_phase_pass_pct,max_days_per_phase,warning
+10,9,0.0,0.0,20,Exploratory CLOSED-PNL daily bootstrap; ignores intraday/floating breach and cross-day overlapping position effects. NOT a valid FTMO pass probability.

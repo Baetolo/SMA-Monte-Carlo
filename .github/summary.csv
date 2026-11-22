@@ -1,0 +1,2 @@
+initial_capital,final_equity_including_open_pnl,return_pct,closed_trades,open_positions_at_end,signals,filled_signals,skipped_margin_or_lot,win_rate_pct,profit_factor,max_mark_to_market_drawdown_pct,approx_ftmo_daily_breach_any,approx_ftmo_total_breach_any,note
+50000,46377.055533357954,-7.245888933284094,72,0,73,72,1,19.444444444444443,0.7789514630559041,-11.562307243705439,True,True,No forced liquidation at dataset end; unrealized P&L included in final equity.
