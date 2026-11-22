@@ -35,7 +35,8 @@ def main():
     aud = curve.copy()
     for c in ['equity', 'cash']:
         aud[c] = aud[c] / a.usd_per_aud
-    aud.to_csv(ROOT / 'data' / 'daily_equity.csv', index=False)
+   (ROOT / 'data').mkdir(parents=True, exist_ok=True)
+aud.to_csv(ROOT / 'data' / 'daily_equity.csv', index=False)
     summary.update({'capital_aud': a.capital_aud, 'usd_per_aud_assumed': a.usd_per_aud, 'capital_usd': capital_usd, 'symbols_requested_total': len(tickers), 'symbols_with_data': len(prices), 'symbols_missing': len(failed), 'currency_assumption': 'constant USD/AUD; FX fluctuations and conversion costs excluded'})
     pd.Series(summary).to_csv(out / 'summary.csv', header=['value'])
     print(pd.Series(summary).to_string())
