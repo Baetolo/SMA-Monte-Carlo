@@ -1,0 +1,29 @@
+name: Gold VWAP EMA backtest and exploratory Monte Carlo
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Check historical CSV
+        run: |
+          test -f data/xauusd_1m.csv || (echo 'Missing data/xauusd_1m.csv: upload your licensed historical XAUUSD 1-minute CSV first' && exit 1)
+      - name: Backtest (research only; no live orders)
+        run: python backtest.py --csv data/xauusd_1m.csv
+      - name: Monte Carlo exploratory bootstrap
+        run: python monte_carlo.py --simulations 10000
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gold-backtest-results
+          path: outputs/*.csv
+          if-no-files-found: warn
