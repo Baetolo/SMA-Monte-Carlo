@@ -1,42 +1,100 @@
+
 name: Gold Download + Backtest (Dukascopy)
+
 on:
   workflow_dispatch:
     inputs:
       from_date:
-        description: 'UTC start date (inclusive)'
+        description: "Start date (YYYY-MM-DD)"
         required: true
-        default: '2026-01-01'
+        default: "2026-01-01"
+        type: string
       to_date:
-        description: 'UTC end date (exclusive, max 370 days per run)'
+        description: "End date exclusive (YYYY-MM-DD)"
         required: true
-        default: '2026-02-01'
+        default: "2026-02-01"
+        type: string
+
 permissions:
   contents: read
+
 jobs:
   gold:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: pip
+
       - name: Install Python packages
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Restore previously downloaded Gold data.
+      # Each run gets a unique cache key.
+      # Earlier caches can be restored using the prefix.
+      - name: Restore Gold historical data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/gold_cache
+          key: gold-data-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            gold-data-
+
       - name: Download XAUUSD 1-minute BID bars
-        run: python download_gold.py --from-date '${{ inputs.from_date }}' --to-date '${{ inputs.to_date }}'
-      - name: Backtest (no live orders)
-        run: python backtest.py --csv data/xauusd_1m.csv
-      - name: Exploratory Monte Carlo (not FTMO-certified)
-        run: python monte_carlo.py --simulations 10000
-      - name: Upload results and data
+        id: download
+        continue-on-error: true
+        run: |
+          python download_gold.py \
+            --from-date "${{ inputs.from_date }}" \
+            --to-date "${{ inputs.to_date }}" \
+            --output data/xauusd_1m.csv
+
+      # Save successful daily downloads even if
+      # some other days failed.
+      - name: Save Gold historical data cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/gold_cache
+          key: gold-data-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Check download success
+        if: steps.download.outcome != 'success'
+        run: |
+          echo "Historical download incomplete."
+          echo "Successful daily downloads were cached."
+          echo "Run the workflow again to retry missing days."
+          exit 1
+
+      - name: Run Gold backtest
+        run: |
+          python backtest.py \
+            --csv data/xauusd_1m.csv \
+            --output-dir outputs
+
+      - name: Run Monte Carlo simulations
+        run: |
+          python monte_carlo.py \
+            --trades outputs/trades.csv \
+            --output-dir outputs \
+            --simulations 10000
+
+      - name: Upload backtest results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gold-results-${{ inputs.from_date }}
+          name: gold-backtest-results
           path: |
-            outputs/*.csv
-            data/xauusd_1m.csv
+            outputs/
             data/download_issues.csv
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 30
