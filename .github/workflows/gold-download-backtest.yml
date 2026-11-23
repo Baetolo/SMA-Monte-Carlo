@@ -9,6 +9,7 @@ on:
         required: true
         default: "2026-01-01"
         type: string
+
       to_date:
         description: "End date exclusive (YYYY-MM-DD)"
         required: true
@@ -24,23 +25,24 @@ jobs:
     timeout-minutes: 120
 
     steps:
+      # 1. Get repository files
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2. Set up Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
 
+      # 3. Install dependencies
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Restore previously downloaded Gold data.
-      # Each run gets a unique cache key.
-      # Earlier caches can be restored using the prefix.
+      # 4. Restore previously downloaded data
       - name: Restore Gold historical data cache
         uses: actions/cache/restore@v4
         with:
@@ -49,6 +51,7 @@ jobs:
           restore-keys: |
             gold-data-
 
+      # 5. Download missing Gold data
       - name: Download XAUUSD 1-minute BID bars
         id: download
         continue-on-error: true
@@ -58,8 +61,7 @@ jobs:
             --to-date "${{ inputs.to_date }}" \
             --output data/xauusd_1m.csv
 
-      # Save successful daily downloads even if
-      # some other days failed.
+      # 6. Save downloaded data for future runs
       - name: Save Gold historical data cache
         if: always()
         uses: actions/cache/save@v4
@@ -67,6 +69,7 @@ jobs:
           path: data/gold_cache
           key: gold-data-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # 7. Stop if historical data is incomplete
       - name: Check download success
         if: steps.download.outcome != 'success'
         run: |
@@ -75,19 +78,25 @@ jobs:
           echo "Run the workflow again to retry missing days."
           exit 1
 
+      # 8. Run 3-minute Gold strategy
       - name: Run Gold backtest
         run: |
           python backtest.py \
             --csv data/xauusd_1m.csv \
-            --output-dir outputs
+            --risk-pct 0.5 \
+            --reward 4.0
 
+      # 9. Check Monte Carlo arguments
+      - name: Check Monte Carlo configuration
+        run: |
+          python monte_carlo.py --help
+
+      # 10. Run exploratory Monte Carlo
       - name: Run Monte Carlo simulations
         run: |
-          python monte_carlo.py \
-            --trades outputs/trades.csv \
-            --output-dir outputs \
-            --simulations 10000
+          python monte_carlo.py
 
+      # 11. Upload results
       - name: Upload backtest results
         if: always()
         uses: actions/upload-artifact@v4
