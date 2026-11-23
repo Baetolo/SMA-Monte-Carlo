@@ -16,6 +16,7 @@ NEW_YORK = ZoneInfo("America/New_York")
 
 def in_session(timestamp):
     ts = pd.Timestamp(timestamp)
+
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     else:
@@ -34,30 +35,48 @@ def load_data(path):
     df = pd.read_csv(path)
 
     time_col = next(
-        (c for c in ["time_utc", "timestamp", "datetime", "time"]
-         if c in df.columns),
+        (
+            c for c in [
+                "time_utc",
+                "timestamp",
+                "datetime",
+                "time"
+            ]
+            if c in df.columns
+        ),
         None
     )
+
     if time_col is None:
         raise ValueError("CSV needs a timestamp column.")
 
-    df["time_utc"] = pd.to_datetime(df[time_col], utc=True)
+    df["time_utc"] = pd.to_datetime(
+        df[time_col], utc=True
+    )
+
     df = df.set_index("time_utc").sort_index()
     df = df[~df.index.duplicated(keep="last")]
 
     for c in ["open", "high", "low", "close"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        df[c] = pd.to_numeric(
+            df[c], errors="coerce"
+        )
 
-    df = df.dropna(subset=["open", "high", "low", "close"])
+    df = df.dropna(
+        subset=["open", "high", "low", "close"]
+    )
 
     if "volume" not in df.columns:
         df["volume"] = 1.0
+
     df["volume"] = pd.to_numeric(
         df["volume"], errors="coerce"
     ).fillna(0)
 
     bars = df.resample(
-        "3min", label="left", closed="left"
+        "3min",
+        label="left",
+        closed="left"
     ).agg({
         "open": "first",
         "high": "max",
@@ -66,7 +85,10 @@ def load_data(path):
         "volume": "sum"
     })
 
-    counts = df["close"].resample("3min").count()
+    counts = df["close"].resample(
+        "3min"
+    ).count()
+
     bars = bars[counts == 3].copy()
     bars = bars.dropna()
 
@@ -76,8 +98,17 @@ def load_data(path):
 def indicators(df):
     df = df.copy()
 
+    # Fast EMA
     df["ema9"] = df["close"].ewm(
-        span=9, adjust=False
+        span=9,
+        adjust=False
+    ).mean()
+
+    # NEW: 200 EMA trend filter
+    df["ema200"] = df["close"].ewm(
+        span=200,
+        adjust=False,
+        min_periods=200
     ).mean()
 
     previous_close = df["close"].shift(1)
@@ -89,31 +120,43 @@ def indicators(df):
     ], axis=1).max(axis=1)
 
     df["atr"] = tr.ewm(
-        alpha=1 / 14, adjust=False,
+        alpha=1 / 14,
+        adjust=False,
         min_periods=14
     ).mean()
 
-    # Reset VWAP at each UTC calendar day.
+    # Daily VWAP, reset at midnight UTC
     session = df.index.normalize()
 
     typical = (
-        df["high"] + df["low"] + df["close"]
+        df["high"] +
+        df["low"] +
+        df["close"]
     ) / 3
 
     volume = df["volume"].clip(lower=0)
 
-    cum_pv = (typical * volume).groupby(
+    cum_pv = (
+        typical * volume
+    ).groupby(session).cumsum()
+
+    cum_vol = volume.groupby(
         session
     ).cumsum()
-    cum_vol = volume.groupby(session).cumsum()
 
-    df["vwap"] = cum_pv / cum_vol.replace(0, np.nan)
+    df["vwap"] = (
+        cum_pv /
+        cum_vol.replace(0, np.nan)
+    )
 
-    # EMA crossing VWAP on completed candles.
+    # EMA 9 crossing VWAP
     previous_diff = (
         df["ema9"] - df["vwap"]
     ).shift(1)
-    current_diff = df["ema9"] - df["vwap"]
+
+    current_diff = (
+        df["ema9"] - df["vwap"]
+    )
 
     df["long_signal"] = (
         (previous_diff <= 0) &
@@ -139,6 +182,7 @@ def run_backtest(
     max_lots
 ):
     cash = float(initial_capital)
+
     positions = []
     trades = []
     signals = []
@@ -146,30 +190,43 @@ def run_backtest(
 
     trade_id = 0
     skipped = 0
+    trend_rejected = 0
+    session_rejected = 0
+
     previous_day = None
     day_start_equity = initial_capital
+
     peak_equity = initial_capital
     max_drawdown = 0.0
+
     daily_breach = False
     total_breach = False
 
     def unrealized(close):
         total = 0.0
+
         for p in positions:
-            direction = p["side"]
             total += (
                 (close - p["entry"])
-                * direction * p["lots"] * 100
+                * p["side"]
+                * p["lots"]
+                * 100
             )
+
         return total
 
-    def close_trade(p, exit_price, exit_time, reason):
+    def close_trade(
+        p, exit_price, exit_time, reason
+    ):
         nonlocal cash
 
         gross = (
             (exit_price - p["entry"])
-            * p["side"] * p["lots"] * 100
+            * p["side"]
+            * p["lots"]
+            * 100
         )
+
         exit_commission = (
             p["lots"] * commission_per_lot
         )
@@ -182,7 +239,9 @@ def run_backtest(
             "entry_time_utc": p["entry_time"],
             "exit_time_utc": exit_time,
             "direction": (
-                "LONG" if p["side"] == 1 else "SHORT"
+                "LONG"
+                if p["side"] == 1
+                else "SHORT"
             ),
             "lots": p["lots"],
             "entry": p["entry"],
@@ -192,33 +251,33 @@ def run_backtest(
             "reason": reason,
             "gross_pnl": gross,
             "net_pnl": (
-                gross - exit_commission
+                gross
+                - exit_commission
                 - p["entry_commission"]
             ),
             "commission_total": (
-                exit_commission + p["entry_commission"]
+                exit_commission
+                + p["entry_commission"]
             )
         })
 
-    # Previous completed candle generates the signal;
-    # current candle opens the position.
     for i in range(1, len(df)):
         bar = df.iloc[i]
         prev = df.iloc[i - 1]
+
         timestamp = df.index[i]
         signal_time = df.index[i - 1]
 
         day = timestamp.date()
 
         if previous_day != day:
-            day_start_equity = cash + unrealized(
-                float(bar["open"])
+            day_start_equity = (
+                cash +
+                unrealized(float(bar["open"]))
             )
             previous_day = day
 
-        # First manage existing positions.
-        # Conservative assumption: stop wins when
-        # both stop and target occur in one candle.
+        # Manage existing positions
         survivors = []
 
         for p in positions:
@@ -232,9 +291,11 @@ def run_backtest(
                         float(bar["open"])
                     ) - execution_buffer
                     reason = "STOP"
+
                 elif bar["high"] >= p["target"]:
                     exit_price = p["target"]
                     reason = "TARGET"
+
             else:
                 if bar["high"] >= p["stop"]:
                     exit_price = max(
@@ -242,6 +303,7 @@ def run_backtest(
                         float(bar["open"])
                     ) + execution_buffer
                     reason = "STOP"
+
                 elif bar["low"] <= p["target"]:
                     exit_price = p["target"]
                     reason = "TARGET"
@@ -250,81 +312,134 @@ def run_backtest(
                 survivors.append(p)
             else:
                 close_trade(
-                    p, exit_price, timestamp, reason
+                    p,
+                    exit_price,
+                    timestamp,
+                    reason
                 )
 
         positions = survivors
 
-        side = 0
-        if bool(prev["long_signal"]):
-            side = 1
-        elif bool(prev["short_signal"]):
-            side = -1
+        # ----------------------------------
+        # EMA 9 / VWAP crossover
+        # PLUS 200 EMA trend filter
+        # ----------------------------------
 
-        if side:
-            allowed = in_session(signal_time)
+        side = 0
+
+        raw_long = bool(prev["long_signal"])
+        raw_short = bool(prev["short_signal"])
+
+        if raw_long or raw_short:
+            allowed_session = in_session(
+                signal_time
+            )
+
+            trend_ok = False
+
+            if pd.notna(prev["ema200"]):
+                if (
+                    raw_long
+                    and prev["close"] > prev["ema200"]
+                ):
+                    side = 1
+                    trend_ok = True
+
+                elif (
+                    raw_short
+                    and prev["close"] < prev["ema200"]
+                ):
+                    side = -1
+                    trend_ok = True
+
             signals.append({
                 "signal_time_utc": signal_time,
-                "direction": (
-                    "LONG" if side == 1 else "SHORT"
+                "raw_direction": (
+                    "LONG"
+                    if raw_long
+                    else "SHORT"
                 ),
-                "session_allowed": allowed
+                "session_allowed": allowed_session,
+                "trend_allowed": trend_ok,
+                "ema200": prev["ema200"],
+                "close": prev["close"]
             })
 
-            if allowed and np.isfinite(prev["atr"]):
+            if not allowed_session:
+                session_rejected += 1
+
+            if allowed_session and not trend_ok:
+                trend_rejected += 1
+
+            if not allowed_session:
+                side = 0
+
+        if side:
+            if np.isfinite(prev["atr"]):
                 atr = float(prev["atr"])
-                stop_distance = atr * atr_multiple
+
+                stop_distance = (
+                    atr * atr_multiple
+                )
 
                 if stop_distance > 0:
-                    # Buy at ask approximation,
-                    # sell at bid approximation.
                     entry = float(bar["open"])
+
                     if side == 1:
                         entry += execution_buffer
 
-                    equity_before = cash + unrealized(
-                        float(bar["open"])
-                    )
-                    risk_dollars = max(
-                        0, equity_before * risk_pct / 100
+                    equity_before = (
+                        cash +
+                        unrealized(float(bar["open"]))
                     )
 
-                    # 100 oz per standard XAUUSD lot.
+                    risk_dollars = max(
+                        0,
+                        equity_before * risk_pct / 100
+                    )
+
                     lots = np.floor(
                         risk_dollars /
-                        (stop_distance * 100) * 100
+                        (stop_distance * 100)
+                        * 100
                     ) / 100
 
                     lots = min(lots, max_lots)
 
                     if lots >= 0.01 and cash > 0:
                         stop = (
-                            entry - side * stop_distance
+                            entry
+                            - side * stop_distance
                         )
+
                         target = (
-                            entry + side
-                            * stop_distance * reward
+                            entry
+                            + side
+                            * stop_distance
+                            * reward
                         )
 
                         entry_commission = (
                             lots * commission_per_lot
                         )
 
-                        # Simplified margin check:
-                        # do not allow notional exposure
-                        # beyond 100x positive equity.
                         existing_notional = sum(
-                            p["lots"] * 100
+                            p["lots"]
+                            * 100
                             * float(bar["open"])
                             for p in positions
                         )
+
                         new_notional = (
                             lots * 100 * entry
                         )
 
                         if (
-                            existing_notional + new_notional
-                            <= max(equity_before, 0) * 100
+                            existing_notional
+                            + new_notional
+                            <= max(
+                                equity_before, 0
+                            ) * 100
                         ):
                             trade_id += 1
                             cash -= entry_commission
@@ -348,26 +463,35 @@ def run_backtest(
                         skipped += 1
 
         current_equity = (
-            cash + unrealized(float(bar["close"]))
+            cash +
+            unrealized(float(bar["close"]))
         )
-        peak_equity = max(peak_equity, current_equity)
+
+        peak_equity = max(
+            peak_equity,
+            current_equity
+        )
 
         if peak_equity > 0:
             drawdown = (
                 peak_equity - current_equity
             ) / peak_equity * 100
+
             max_drawdown = max(
-                max_drawdown, drawdown
+                max_drawdown,
+                drawdown
             )
 
-        # Approximate FTMO limits only.
-        day_loss = (
+        if (
             day_start_equity - current_equity
-        )
-        if day_loss > initial_capital * 0.05:
+            > initial_capital * 0.05
+        ):
             daily_breach = True
 
-        if current_equity < initial_capital * 0.90:
+        if (
+            current_equity
+            < initial_capital * 0.90
+        ):
             total_breach = True
 
         equity_rows.append({
@@ -388,6 +512,7 @@ def run_backtest(
         })
 
     final_equity = cash
+
     if len(df) and positions:
         final_equity += unrealized(
             float(df["close"].iloc[-1])
@@ -398,18 +523,28 @@ def run_backtest(
     signal_df = pd.DataFrame(signals)
 
     if not trade_df.empty:
-        wins = (trade_df["net_pnl"] > 0).sum()
+        wins = (
+            trade_df["net_pnl"] > 0
+        ).sum()
+
         gross_wins = trade_df.loc[
-            trade_df["net_pnl"] > 0, "net_pnl"
-        ].sum()
-        gross_losses = -trade_df.loc[
-            trade_df["net_pnl"] < 0, "net_pnl"
+            trade_df["net_pnl"] > 0,
+            "net_pnl"
         ].sum()
 
-        win_rate = wins / len(trade_df) * 100
+        gross_losses = -trade_df.loc[
+            trade_df["net_pnl"] < 0,
+            "net_pnl"
+        ].sum()
+
+        win_rate = (
+            wins / len(trade_df) * 100
+        )
+
         profit_factor = (
             gross_wins / gross_losses
-            if gross_losses > 0 else np.nan
+            if gross_losses > 0
+            else np.nan
         )
     else:
         win_rate = 0
@@ -419,51 +554,74 @@ def run_backtest(
         "initial_capital": initial_capital,
         "final_equity_including_open_pnl": final_equity,
         "return_pct": (
-            (final_equity / initial_capital - 1) * 100
-        ),
+            final_equity / initial_capital - 1
+        ) * 100,
         "closed_trades": len(trade_df),
         "open_positions_at_end": len(positions),
         "signals": len(signal_df),
         "filled_signals": trade_id,
         "skipped_margin_or_lot": skipped,
+        "session_rejected": session_rejected,
+        "trend_rejected": trend_rejected,
         "win_rate_pct": win_rate,
         "profit_factor": profit_factor,
-        "max_mark_to_market_drawdown_pct": max_drawdown,
-        "approx_ftmo_daily_breach_any": daily_breach,
-        "approx_ftmo_total_breach_any": total_breach,
+        "max_mark_to_market_drawdown_pct": (
+            max_drawdown
+        ),
+        "approx_ftmo_daily_breach_any": (
+            daily_breach
+        ),
+        "approx_ftmo_total_breach_any": (
+            total_breach
+        ),
         "risk_pct": risk_pct,
         "reward_multiple": reward,
-        "session_filter": "London + New York"
+        "session_filter": "London + New York",
+        "trend_filter": "EMA 200"
     }
 
-    OUTPUT.mkdir(exist_ok=True, parents=True)
+    OUTPUT.mkdir(
+        exist_ok=True,
+        parents=True
+    )
 
     trade_df.to_csv(
-        OUTPUT / "trades.csv", index=False
+        OUTPUT / "trades.csv",
+        index=False
     )
+
     equity_df.to_csv(
-        OUTPUT / "equity_curve.csv", index=False
+        OUTPUT / "equity_curve.csv",
+        index=False
     )
+
     signal_df.to_csv(
-        OUTPUT / "signals.csv", index=False
+        OUTPUT / "signals.csv",
+        index=False
     )
 
     if not equity_df.empty:
         daily = (
-            equity_df.groupby("session", as_index=False)
+            equity_df.groupby(
+                "session",
+                as_index=False
+            )
             .tail(1)
             .copy()
         )
+
         daily.to_csv(
             OUTPUT / "daily_equity.csv",
             index=False
         )
 
     pd.DataFrame([summary]).to_csv(
-        OUTPUT / "summary.csv", index=False
+        OUTPUT / "summary.csv",
+        index=False
     )
 
     print("\n=== GOLD BACKTEST RESULTS ===")
+
     for key, value in summary.items():
         print(f"{key}: {value}")
 
@@ -477,40 +635,62 @@ def main():
         "--csv",
         default="data/xauusd_1m.csv"
     )
+
     parser.add_argument(
-        "--capital", type=float, default=50000
+        "--capital",
+        type=float,
+        default=50000
     )
+
     parser.add_argument(
-        "--risk-pct", type=float, default=0.5
+        "--risk-pct",
+        type=float,
+        default=0.5
     )
+
     parser.add_argument(
-        "--reward", type=float, default=2.0
+        "--reward",
+        type=float,
+        default=2.0
     )
+
     parser.add_argument(
-        "--atr-multiple", type=float, default=2.0
+        "--atr-multiple",
+        type=float,
+        default=2.0
     )
+
     parser.add_argument(
-        "--execution-buffer", type=float,
+        "--execution-buffer",
+        type=float,
         default=0.20
     )
+
     parser.add_argument(
-        "--commission-per-lot", type=float,
+        "--commission-per-lot",
+        type=float,
         default=3.5
     )
+
     parser.add_argument(
-        "--max-lots", type=float, default=100.0
+        "--max-lots",
+        type=float,
+        default=100.0
     )
 
     args = parser.parse_args()
 
     csv_path = Path(args.csv)
+
     if not csv_path.is_absolute():
         csv_path = ROOT / csv_path
 
     bars = load_data(csv_path)
     bars = indicators(bars)
 
-    print(f"Loaded {len(bars):,} three-minute bars")
+    print(
+        f"Loaded {len(bars):,} three-minute bars"
+    )
 
     run_backtest(
         bars,
