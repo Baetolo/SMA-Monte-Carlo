@@ -55,7 +55,7 @@ def backtest(bars, capital, risk_pct, reward, atr_mult, buffer, commission, max_
     daily_breach = total_breach = False
     day_start_equity = cash
     current_day = None
-    rejected_session = rejected_trend = rejected_size = 0
+    rejected_session = rejected_trend = rejected_size = rejected_position_limit = 0
 
     def mark(price):
         return sum((price-p['entry'])*p['side']*p['lots']*100 for p in open_positions)
@@ -63,6 +63,7 @@ def backtest(bars, capital, risk_pct, reward, atr_mult, buffer, commission, max_
     for i in range(2, len(bars)):
         ts = bars.index[i]
         bar, sig, pull = bars.iloc[i], bars.iloc[i-1], bars.iloc[i-2]
+        before_pull = bars.iloc[i-3] if i >= 3 else None
         open_price = float(bar.open)
         if ts.date() != current_day:
             current_day = ts.date()
@@ -99,10 +100,12 @@ def backtest(bars, capital, risk_pct, reward, atr_mult, buffer, commission, max_
 
         # Pullback candle touches EMA9; next candle confirms in trend direction.
         long_signal = (pd.notna(sig.ema200) and
+            before_pull is not None and before_pull.close > before_pull.ema9 and
             pull.low <= pull.ema9 and pull.close <= pull.ema9 and
             sig.close > sig.open and sig.close > sig.ema9 and
             sig.close > sig.ema200)
         short_signal = (pd.notna(sig.ema200) and
+            before_pull is not None and before_pull.close < before_pull.ema9 and
             pull.high >= pull.ema9 and pull.close >= pull.ema9 and
             sig.close < sig.open and sig.close < sig.ema9 and
             sig.close < sig.ema200)
@@ -113,6 +116,8 @@ def backtest(bars, capital, risk_pct, reward, atr_mult, buffer, commission, max_
                 direction='LONG' if side==1 else 'SHORT', session_allowed=allowed))
             if not allowed:
                 rejected_session += 1
+            elif len(open_positions) >= 2:
+                rejected_position_limit += 1
             elif pd.notna(sig.atr) and sig.atr > 0:
                 distance = float(sig.atr)*atr_mult
                 entry = open_price+(buffer if side==1 else 0.0)
@@ -157,6 +162,7 @@ def backtest(bars, capital, risk_pct, reward, atr_mult, buffer, commission, max_
         open_positions_at_end=len(open_positions), signals=len(s),
         filled_signals=next_id, skipped_margin_or_lot=rejected_size,
         session_rejected=rejected_session, trend_rejected=rejected_trend,
+        rejected_position_limit=rejected_position_limit,
         win_rate_pct=(net.gt(0).mean()*100 if len(net) else 0),
         profit_factor=(winners/losers if losers else np.nan),
         max_mark_to_market_drawdown_pct=max_dd,
@@ -164,7 +170,7 @@ def backtest(bars, capital, risk_pct, reward, atr_mult, buffer, commission, max_
         approx_ftmo_total_breach_any=total_breach,
         risk_pct=risk_pct, reward_multiple=reward,
         session_filter='London + New York', trend_filter='EMA 200',
-        entry_rule='EMA9 two-candle pullback confirmation')
+        entry_rule='EMA9 fresh cross-back pullback confirmation; max 2 positions')
     output.mkdir(parents=True, exist_ok=True)
     t.to_csv(output/'trades.csv', index=False)
     e.to_csv(output/'equity_curve.csv', index=False)
