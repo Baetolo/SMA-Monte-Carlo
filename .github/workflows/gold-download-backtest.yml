@@ -84,7 +84,7 @@ jobs:
           python backtest.py \
             --csv data/xauusd_1m.csv \
             --risk-pct 0.5 \
-            --reward 4.0
+            --reward 2.0
 
       # 9. Check Monte Carlo arguments
       - name: Check Monte Carlo configuration
