@@ -1,708 +1,197 @@
-
 import argparse
-from pathlib import Path
 from datetime import time
+from pathlib import Path
 from zoneinfo import ZoneInfo
-
 import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
-OUTPUT = ROOT / "outputs"
-
-LONDON = ZoneInfo("Europe/London")
-NEW_YORK = ZoneInfo("America/New_York")
+LONDON = ZoneInfo('Europe/London')
+NEW_YORK = ZoneInfo('America/New_York')
 
 
-def in_session(timestamp):
-    ts = pd.Timestamp(timestamp)
-
-    if ts.tzinfo is None:
-        ts = ts.tz_localize("UTC")
-    else:
-        ts = ts.tz_convert("UTC")
-
-    london_time = ts.tz_convert(LONDON).time()
-    new_york_time = ts.tz_convert(NEW_YORK).time()
-
-    return (
-        time(8, 0) <= london_time < time(17, 0)
-        or time(8, 0) <= new_york_time < time(17, 0)
-    )
+def in_session(ts):
+    ts = pd.Timestamp(ts)
+    ts = ts.tz_localize('UTC') if ts.tzinfo is None else ts.tz_convert('UTC')
+    return (time(8) <= ts.tz_convert(LONDON).time() < time(17) or
+            time(8) <= ts.tz_convert(NEW_YORK).time() < time(17))
 
 
-def load_data(path):
+def load_bars(path):
     df = pd.read_csv(path)
-
-    time_col = next(
-        (
-            c for c in [
-                "time_utc",
-                "timestamp",
-                "datetime",
-                "time"
-            ]
-            if c in df.columns
-        ),
-        None
-    )
-
+    time_col = next((c for c in ('time_utc', 'timestamp', 'datetime', 'time') if c in df), None)
     if time_col is None:
-        raise ValueError("CSV needs a timestamp column.")
-
-    df["time_utc"] = pd.to_datetime(
-        df[time_col], utc=True
-    )
-
-    df = df.set_index("time_utc").sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-
-    for c in ["open", "high", "low", "close"]:
-        df[c] = pd.to_numeric(
-            df[c], errors="coerce"
-        )
-
-    df = df.dropna(
-        subset=["open", "high", "low", "close"]
-    )
-
-    if "volume" not in df.columns:
-        df["volume"] = 1.0
-
-    df["volume"] = pd.to_numeric(
-        df["volume"], errors="coerce"
-    ).fillna(0)
-
-    bars = df.resample(
-        "3min",
-        label="left",
-        closed="left"
-    ).agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum"
-    })
-
-    counts = df["close"].resample(
-        "3min"
-    ).count()
-
-    bars = bars[counts == 3].copy()
-    bars = bars.dropna()
-
+        raise ValueError('Missing UTC timestamp column')
+    df.index = pd.to_datetime(df[time_col], utc=True)
+    df = df.sort_index()
+    if df.index.has_duplicates:
+        raise ValueError('Duplicate timestamps in input data')
+    for c in ('open', 'high', 'low', 'close'):
+        df[c] = pd.to_numeric(df[c], errors='raise')
+    if 'volume' not in df:
+        df['volume'] = 1.0
+    df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+    agg = df.resample('3min', label='left', closed='left').agg(
+        {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
+    counts = df['close'].resample('3min').count()
+    bars = agg.loc[counts.eq(3)].dropna().copy()
+    if bars.empty:
+        raise ValueError('No complete three-minute candles')
+    bars['ema9'] = bars.close.ewm(span=9, adjust=False).mean()
+    bars['ema200'] = bars.close.ewm(span=200, adjust=False, min_periods=200).mean()
+    prior = bars.close.shift()
+    tr = pd.concat([bars.high - bars.low, (bars.high-prior).abs(),
+                    (bars.low-prior).abs()], axis=1).max(axis=1)
+    bars['atr'] = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
     return bars
 
 
-def indicators(df):
-    df = df.copy()
+def backtest(bars, capital, risk_pct, reward, atr_mult, buffer, commission, max_lots, output):
+    cash = float(capital)
+    open_positions, trades, signals, curve = [], [], [], []
+    next_id = 0
+    peak = cash
+    max_dd = 0.0
+    daily_breach = total_breach = False
+    day_start_equity = cash
+    current_day = None
+    rejected_session = rejected_trend = rejected_size = 0
 
-    # Fast EMA
-    df["ema9"] = df["close"].ewm(
-        span=9,
-        adjust=False
-    ).mean()
+    def mark(price):
+        return sum((price-p['entry'])*p['side']*p['lots']*100 for p in open_positions)
 
-    # NEW: 200 EMA trend filter
-    df["ema200"] = df["close"].ewm(
-        span=200,
-        adjust=False,
-        min_periods=200
-    ).mean()
+    for i in range(2, len(bars)):
+        ts = bars.index[i]
+        bar, sig, pull = bars.iloc[i], bars.iloc[i-1], bars.iloc[i-2]
+        open_price = float(bar.open)
+        if ts.date() != current_day:
+            current_day = ts.date()
+            day_start_equity = cash + mark(open_price)
 
-    previous_close = df["close"].shift(1)
-
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - previous_close).abs(),
-        (df["low"] - previous_close).abs()
-    ], axis=1).max(axis=1)
-
-    df["atr"] = tr.ewm(
-        alpha=1 / 14,
-        adjust=False,
-        min_periods=14
-    ).mean()
-
-    # Daily VWAP, reset at midnight UTC
-    session = df.index.normalize()
-
-    typical = (
-        df["high"] +
-        df["low"] +
-        df["close"]
-    ) / 3
-
-    volume = df["volume"].clip(lower=0)
-
-    cum_pv = (
-        typical * volume
-    ).groupby(session).cumsum()
-
-    cum_vol = volume.groupby(
-        session
-    ).cumsum()
-
-    df["vwap"] = (
-        cum_pv /
-        cum_vol.replace(0, np.nan)
-    )
-
-    # EMA 9 crossing VWAP
-    previous_diff = (
-        df["ema9"] - df["vwap"]
-    ).shift(1)
-
-    current_diff = (
-        df["ema9"] - df["vwap"]
-    )
-
-    df["long_signal"] = (
-        (previous_diff <= 0) &
-        (current_diff > 0)
-    )
-
-    df["short_signal"] = (
-        (previous_diff >= 0) &
-        (current_diff < 0)
-    )
-
-    return df
-
-
-def run_backtest(
-    df,
-    initial_capital,
-    risk_pct,
-    reward,
-    atr_multiple,
-    execution_buffer,
-    commission_per_lot,
-    max_lots
-):
-    cash = float(initial_capital)
-
-    positions = []
-    trades = []
-    signals = []
-    equity_rows = []
-
-    trade_id = 0
-    skipped = 0
-    trend_rejected = 0
-    session_rejected = 0
-
-    previous_day = None
-    day_start_equity = initial_capital
-
-    peak_equity = initial_capital
-    max_drawdown = 0.0
-
-    daily_breach = False
-    total_breach = False
-
-    def unrealized(close):
-        total = 0.0
-
-        for p in positions:
-            total += (
-                (close - p["entry"])
-                * p["side"]
-                * p["lots"]
-                * 100
-            )
-
-        return total
-
-    def close_trade(
-        p, exit_price, exit_time, reason
-    ):
-        nonlocal cash
-
-        gross = (
-            (exit_price - p["entry"])
-            * p["side"]
-            * p["lots"]
-            * 100
-        )
-
-        exit_commission = (
-            p["lots"] * commission_per_lot
-        )
-
-        cash += gross - exit_commission
-
-        trades.append({
-            "trade_id": p["id"],
-            "signal_time_utc": p["signal_time"],
-            "entry_time_utc": p["entry_time"],
-            "exit_time_utc": exit_time,
-            "direction": (
-                "LONG"
-                if p["side"] == 1
-                else "SHORT"
-            ),
-            "lots": p["lots"],
-            "entry": p["entry"],
-            "stop": p["stop"],
-            "target": p["target"],
-            "exit": exit_price,
-            "reason": reason,
-            "gross_pnl": gross,
-            "net_pnl": (
-                gross
-                - exit_commission
-                - p["entry_commission"]
-            ),
-            "commission_total": (
-                exit_commission
-                + p["entry_commission"]
-            )
-        })
-
-    for i in range(1, len(df)):
-        bar = df.iloc[i]
-        prev = df.iloc[i - 1]
-
-        timestamp = df.index[i]
-        signal_time = df.index[i - 1]
-
-        day = timestamp.date()
-
-        if previous_day != day:
-            day_start_equity = (
-                cash +
-                unrealized(float(bar["open"]))
-            )
-            previous_day = day
-
-        # Manage existing positions
-        survivors = []
-
-        for p in positions:
+        # Exit existing positions; if both stop and target touch, stop takes priority.
+        remaining = []
+        for p in open_positions:
             exit_price = None
             reason = None
-
-            if p["side"] == 1:
-                if bar["low"] <= p["stop"]:
-                    exit_price = min(
-                        p["stop"],
-                        float(bar["open"])
-                    ) - execution_buffer
-                    reason = "STOP"
-
-                elif bar["high"] >= p["target"]:
-                    exit_price = p["target"]
-                    reason = "TARGET"
-
+            if p['side'] == 1:
+                if bar.low <= p['stop']:
+                    exit_price, reason = min(float(bar.open), p['stop'])-buffer, 'STOP'
+                elif bar.high >= p['target']:
+                    exit_price, reason = p['target'], 'TARGET'
             else:
-                if bar["high"] >= p["stop"]:
-                    exit_price = max(
-                        p["stop"],
-                        float(bar["open"])
-                    ) + execution_buffer
-                    reason = "STOP"
-
-                elif bar["low"] <= p["target"]:
-                    exit_price = p["target"]
-                    reason = "TARGET"
-
+                if bar.high >= p['stop']:
+                    exit_price, reason = max(float(bar.open), p['stop'])+buffer, 'STOP'
+                elif bar.low <= p['target']:
+                    exit_price, reason = p['target'], 'TARGET'
             if exit_price is None:
-                survivors.append(p)
-            else:
-                close_trade(
-                    p,
-                    exit_price,
-                    timestamp,
-                    reason
-                )
+                remaining.append(p)
+                continue
+            gross = (exit_price-p['entry'])*p['side']*p['lots']*100
+            exit_fee = p['lots']*commission
+            cash += gross-exit_fee
+            trades.append(dict(trade_id=p['id'], signal_time_utc=p['signal_time'],
+                entry_time_utc=p['entry_time'], exit_time_utc=ts,
+                direction='LONG' if p['side']==1 else 'SHORT', lots=p['lots'],
+                entry=p['entry'], stop=p['stop'], target=p['target'], exit=exit_price,
+                reason=reason, gross_pnl=gross, net_pnl=gross-exit_fee-p['entry_fee'],
+                commission_total=exit_fee+p['entry_fee']))
+        open_positions = remaining
 
-        positions = survivors
-
-        # ----------------------------------
-        # EMA 9 / VWAP crossover
-        # PLUS 200 EMA trend filter
-        # ----------------------------------
-
-        side = 0
-
-        raw_long = bool(prev["long_signal"])
-        raw_short = bool(prev["short_signal"])
-
-        if raw_long or raw_short:
-            allowed_session = in_session(
-                signal_time
-            )
-
-            trend_ok = False
-
-            if pd.notna(prev["ema200"]):
-                if (
-                    raw_long
-                    and prev["close"] > prev["ema200"]
-                ):
-                    side = 1
-                    trend_ok = True
-
-                elif (
-                    raw_short
-                    and prev["close"] < prev["ema200"]
-                ):
-                    side = -1
-                    trend_ok = True
-
-            signals.append({
-                "signal_time_utc": signal_time,
-                "raw_direction": (
-                    "LONG"
-                    if raw_long
-                    else "SHORT"
-                ),
-                "session_allowed": allowed_session,
-                "trend_allowed": trend_ok,
-                "ema200": prev["ema200"],
-                "close": prev["close"]
-            })
-
-            if not allowed_session:
-                session_rejected += 1
-
-            if allowed_session and not trend_ok:
-                trend_rejected += 1
-
-            if not allowed_session:
-                side = 0
-
+        # Pullback candle touches EMA9; next candle confirms in trend direction.
+        long_signal = (pd.notna(sig.ema200) and
+            pull.low <= pull.ema9 and pull.close <= pull.ema9 and
+            sig.close > sig.open and sig.close > sig.ema9 and
+            sig.close > sig.ema200)
+        short_signal = (pd.notna(sig.ema200) and
+            pull.high >= pull.ema9 and pull.close >= pull.ema9 and
+            sig.close < sig.open and sig.close < sig.ema9 and
+            sig.close < sig.ema200)
+        side = 1 if long_signal else (-1 if short_signal else 0)
         if side:
-            if np.isfinite(prev["atr"]):
-                atr = float(prev["atr"])
+            allowed = in_session(bars.index[i-1])
+            signals.append(dict(signal_time_utc=bars.index[i-1],
+                direction='LONG' if side==1 else 'SHORT', session_allowed=allowed))
+            if not allowed:
+                rejected_session += 1
+            elif pd.notna(sig.atr) and sig.atr > 0:
+                distance = float(sig.atr)*atr_mult
+                entry = open_price+(buffer if side==1 else 0.0)
+                equity = cash+mark(open_price)
+                lots = min(np.floor((max(0,equity)*risk_pct/100)/(distance*100)*100)/100,
+                           max_lots)
+                existing_notional = sum(p['lots']*100*open_price for p in open_positions)
+                if lots >= 0.01 and cash > 0 and existing_notional+lots*100*entry <= max(equity,0)*100:
+                    next_id += 1
+                    fee = lots*commission
+                    cash -= fee
+                    open_positions.append(dict(id=next_id, signal_time=bars.index[i-1],
+                        entry_time=ts, side=side, entry=entry,
+                        stop=entry-side*distance, target=entry+side*distance*reward,
+                        lots=lots, entry_fee=fee))
+                else:
+                    rejected_size += 1
 
-                stop_distance = (
-                    atr * atr_multiple
-                )
+        equity = cash+mark(float(bar.close))
+        peak = max(peak, equity)
+        max_dd = max(max_dd, (peak-equity)/peak*100 if peak > 0 else 0)
+        # Approximation only, not official FTMO compliance calculation.
+        daily_breach |= day_start_equity-equity > capital*0.05
+        total_breach |= equity < capital*0.90
+        curve.append(dict(time_utc=ts, session=str(ts.date()), cash=cash,
+            unrealized_pnl=equity-cash, equity=equity,
+            open_positions=len(open_positions),
+            ftmo_daily_breach_approx=daily_breach,
+            ftmo_total_breach_approx=total_breach))
 
-                if stop_distance > 0:
-                    entry = float(bar["open"])
-
-                    if side == 1:
-                        entry += execution_buffer
-
-                    equity_before = (
-                        cash +
-                        unrealized(float(bar["open"]))
-                    )
-
-                    risk_dollars = max(
-                        0,
-                        equity_before * risk_pct / 100
-                    )
-
-                    lots = np.floor(
-                        risk_dollars /
-                        (stop_distance * 100)
-                        * 100
-                    ) / 100
-
-                    lots = min(lots, max_lots)
-
-                    if lots >= 0.01 and cash > 0:
-                        stop = (
-                            entry
-                            - side * stop_distance
-                        )
-
-                        target = (
-                            entry
-                            + side
-                            * stop_distance
-                            * reward
-                        )
-
-                        entry_commission = (
-                            lots * commission_per_lot
-                        )
-
-                        existing_notional = sum(
-                            p["lots"]
-                            * 100
-                            * float(bar["open"])
-                            for p in positions
-                        )
-
-                        new_notional = (
-                            lots * 100 * entry
-                        )
-
-                        if (
-                            existing_notional
-                            + new_notional
-                            <= max(
-                                equity_before, 0
-                            ) * 100
-                        ):
-                            trade_id += 1
-                            cash -= entry_commission
-
-                            positions.append({
-                                "id": trade_id,
-                                "signal_time": signal_time,
-                                "entry_time": timestamp,
-                                "side": side,
-                                "entry": entry,
-                                "stop": stop,
-                                "target": target,
-                                "lots": lots,
-                                "entry_commission": (
-                                    entry_commission
-                                )
-                            })
-                        else:
-                            skipped += 1
-                    else:
-                        skipped += 1
-
-        current_equity = (
-            cash +
-            unrealized(float(bar["close"]))
-        )
-
-        peak_equity = max(
-            peak_equity,
-            current_equity
-        )
-
-        if peak_equity > 0:
-            drawdown = (
-                peak_equity - current_equity
-            ) / peak_equity * 100
-
-            max_drawdown = max(
-                max_drawdown,
-                drawdown
-            )
-
-        if (
-            day_start_equity - current_equity
-            > initial_capital * 0.05
-        ):
-            daily_breach = True
-
-        if (
-            current_equity
-            < initial_capital * 0.90
-        ):
-            total_breach = True
-
-        equity_rows.append({
-            "time_utc": timestamp,
-            "session": str(day),
-            "cash": cash,
-            "unrealized_pnl": (
-                current_equity - cash
-            ),
-            "equity": current_equity,
-            "open_positions": len(positions),
-            "ftmo_daily_breach_approx": (
-                daily_breach
-            ),
-            "ftmo_total_breach_approx": (
-                total_breach
-            )
-        })
-
-    final_equity = cash
-
-    if len(df) and positions:
-        final_equity += unrealized(
-            float(df["close"].iloc[-1])
-        )
-
-    trade_df = pd.DataFrame(trades)
-    equity_df = pd.DataFrame(equity_rows)
-    signal_df = pd.DataFrame(signals)
-
-    if not trade_df.empty:
-        wins = (
-            trade_df["net_pnl"] > 0
-        ).sum()
-
-        gross_wins = trade_df.loc[
-            trade_df["net_pnl"] > 0,
-            "net_pnl"
-        ].sum()
-
-        gross_losses = -trade_df.loc[
-            trade_df["net_pnl"] < 0,
-            "net_pnl"
-        ].sum()
-
-        win_rate = (
-            wins / len(trade_df) * 100
-        )
-
-        profit_factor = (
-            gross_wins / gross_losses
-            if gross_losses > 0
-            else np.nan
-        )
-    else:
-        win_rate = 0
-        profit_factor = 0
-
-    summary = {
-        "initial_capital": initial_capital,
-        "final_equity_including_open_pnl": final_equity,
-        "return_pct": (
-            final_equity / initial_capital - 1
-        ) * 100,
-        "closed_trades": len(trade_df),
-        "open_positions_at_end": len(positions),
-        "signals": len(signal_df),
-        "filled_signals": trade_id,
-        "skipped_margin_or_lot": skipped,
-        "session_rejected": session_rejected,
-        "trend_rejected": trend_rejected,
-        "win_rate_pct": win_rate,
-        "profit_factor": profit_factor,
-        "max_mark_to_market_drawdown_pct": (
-            max_drawdown
-        ),
-        "approx_ftmo_daily_breach_any": (
-            daily_breach
-        ),
-        "approx_ftmo_total_breach_any": (
-            total_breach
-        ),
-        "risk_pct": risk_pct,
-        "reward_multiple": reward,
-        "session_filter": "London + New York",
-        "trend_filter": "EMA 200"
-    }
-
-    OUTPUT.mkdir(
-        exist_ok=True,
-        parents=True
-    )
-
-    trade_df.to_csv(
-        OUTPUT / "trades.csv",
-        index=False
-    )
-
-    equity_df.to_csv(
-        OUTPUT / "equity_curve.csv",
-        index=False
-    )
-
-    signal_df.to_csv(
-        OUTPUT / "signals.csv",
-        index=False
-    )
-
-    if not equity_df.empty:
-        daily = (
-            equity_df.groupby(
-                "session",
-                as_index=False
-            )
-            .tail(1)
-            .copy()
-        )
-
-        daily.to_csv(
-            OUTPUT / "daily_equity.csv",
-            index=False
-        )
-
-    pd.DataFrame([summary]).to_csv(
-        OUTPUT / "summary.csv",
-        index=False
-    )
-
-    print("\n=== GOLD BACKTEST RESULTS ===")
-
-    for key, value in summary.items():
-        print(f"{key}: {value}")
-
-    print("\nFiles saved in outputs/")
+    t = pd.DataFrame(trades, columns=['trade_id','signal_time_utc','entry_time_utc',
+        'exit_time_utc','direction','lots','entry','stop','target','exit','reason',
+        'gross_pnl','net_pnl','commission_total'])
+    e = pd.DataFrame(curve)
+    s = pd.DataFrame(signals, columns=['signal_time_utc','direction','session_allowed'])
+    net = t.net_pnl if not t.empty else pd.Series(dtype=float)
+    winners = net[net > 0].sum()
+    losers = -net[net < 0].sum()
+    final = float(e.equity.iloc[-1]) if not e.empty else cash
+    summary = dict(initial_capital=capital, final_equity_including_open_pnl=final,
+        return_pct=(final/capital-1)*100, closed_trades=len(t),
+        open_positions_at_end=len(open_positions), signals=len(s),
+        filled_signals=next_id, skipped_margin_or_lot=rejected_size,
+        session_rejected=rejected_session, trend_rejected=rejected_trend,
+        win_rate_pct=(net.gt(0).mean()*100 if len(net) else 0),
+        profit_factor=(winners/losers if losers else np.nan),
+        max_mark_to_market_drawdown_pct=max_dd,
+        approx_ftmo_daily_breach_any=daily_breach,
+        approx_ftmo_total_breach_any=total_breach,
+        risk_pct=risk_pct, reward_multiple=reward,
+        session_filter='London + New York', trend_filter='EMA 200',
+        entry_rule='EMA9 two-candle pullback confirmation')
+    output.mkdir(parents=True, exist_ok=True)
+    t.to_csv(output/'trades.csv', index=False)
+    e.to_csv(output/'equity_curve.csv', index=False)
+    s.to_csv(output/'signals.csv', index=False)
+    if not e.empty:
+        e.groupby('session', as_index=False).tail(1).to_csv(output/'daily_equity.csv', index=False)
+    pd.DataFrame([summary]).to_csv(output/'summary.csv', index=False)
+    print(pd.Series(summary).to_string())
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    p = argparse.ArgumentParser()
+    p.add_argument('--csv', default='data/xauusd_1m.csv')
+    p.add_argument('--capital', type=float, default=50000)
+    p.add_argument('--risk-pct', type=float, default=0.5)
+    p.add_argument('--reward', type=float, default=2.0)
+    p.add_argument('--atr-multiple', type=float, default=2.0)
+    p.add_argument('--execution-buffer', type=float, default=0.20)
+    p.add_argument('--commission-per-lot', type=float, default=3.5)
+    p.add_argument('--max-lots', type=float, default=100)
+    a = p.parse_args()
+    path = Path(a.csv)
+    if not path.is_absolute():
+        path = Path.cwd()/path
+    backtest(load_bars(path), a.capital, a.risk_pct, a.reward,
+             a.atr_multiple, a.execution_buffer, a.commission_per_lot,
+             a.max_lots, Path.cwd()/'outputs')
 
-    parser.add_argument(
-        "--csv",
-        default="data/xauusd_1m.csv"
-    )
-
-    parser.add_argument(
-        "--capital",
-        type=float,
-        default=50000
-    )
-
-    parser.add_argument(
-        "--risk-pct",
-        type=float,
-        default=0.5
-    )
-
-    parser.add_argument(
-        "--reward",
-        type=float,
-        default=2.0
-    )
-
-    parser.add_argument(
-        "--atr-multiple",
-        type=float,
-        default=2.0
-    )
-
-    parser.add_argument(
-        "--execution-buffer",
-        type=float,
-        default=0.20
-    )
-
-    parser.add_argument(
-        "--commission-per-lot",
-        type=float,
-        default=3.5
-    )
-
-    parser.add_argument(
-        "--max-lots",
-        type=float,
-        default=100.0
-    )
-
-    args = parser.parse_args()
-
-    csv_path = Path(args.csv)
-
-    if not csv_path.is_absolute():
-        csv_path = ROOT / csv_path
-
-    bars = load_data(csv_path)
-    bars = indicators(bars)
-
-    print(
-        f"Loaded {len(bars):,} three-minute bars"
-    )
-
-    run_backtest(
-        bars,
-        args.capital,
-        args.risk_pct,
-        args.reward,
-        args.atr_multiple,
-        args.execution_buffer,
-        args.commission_per_lot,
-        args.max_lots
-    )
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
